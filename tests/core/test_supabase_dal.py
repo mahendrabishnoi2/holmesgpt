@@ -1,7 +1,7 @@
 """Unit tests for SupabaseDal."""
 
 import logging
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 from postgrest.exceptions import APIError as PGAPIError
@@ -341,13 +341,36 @@ def skills_dal():
         return dal
 
 
+def _stub_personal_query(dal, data=None, error=None):
+    """Stub the fluent PostgREST builder for a personal-skill read.
+
+    Every builder method returns the same mock, so the stub does not care how many .eq()
+    calls the DAL chains -- which is what makes it robust to the catalog read (3 filters)
+    and the content read (4) sharing one helper.
+    """
+    q = MagicMock()
+    for method in ("select", "eq", "neq", "in_", "order", "limit", "is_"):
+        getattr(q, method).return_value = q
+    if error is not None:
+        q.execute.side_effect = error
+    else:
+        q.execute.return_value = Mock(data=data)
+    dal.client.table.return_value = q
+    return q
+
+
+def _eq_filters(q):
+    """The {column: value} pairs the DAL filtered on."""
+    return {c.args[0]: c.args[1] for c in q.eq.call_args_list}
+
+
 class TestPersonalSkills:
     """Tests for the personal-skill DAL reads.
 
     These cover the seam the skill_loader tests cannot: those mock the DAL entirely, so
-    they never exercise the RPC call shape or the response parsing. The failure mode here
-    is silent -- a wrong parameter name or an unparsed response yields an empty personal
-    tier with no error, and Holmes simply never loads anyone's personal skills.
+    they never exercise the query shape or the response parsing. The failure mode here is
+    silent -- a missing filter or an unparsed response yields an empty (or another user's)
+    personal tier with no error at all.
     """
 
 
@@ -367,30 +390,69 @@ class TestPersonalSkills:
 
     # ── get_personal_skill_catalog ──
 
-    def test_calls_security_definer_rpc_with_end_user_id(self, skills_dal):
-        """Must go through the RPC, not a table select.
+    def test_selects_scoped_to_account_user_and_subject_type(self, skills_dal):
+        """Reads HolmesRunbooks directly, filtered to this end user's personal rows.
 
-        Personal rows are owner-only under RLS and Holmes authenticates as a service user,
-        so a plain select would match zero rows.
+        RLS admits Holmes to every personal row in the account (it is an API-role account
+        user), so these filters are the only thing keeping one user's catalog from
+        returning another's. A missing user_id filter would look fine in the response.
         """
-        skills_dal.client.rpc.return_value.execute.return_value = Mock(
-            data=[self._row()]
+        q = _stub_personal_query(skills_dal, data=[self._row()])
+
+        result = skills_dal.get_personal_skill_catalog("end-user-1")
+
+        assert result is not None and len(result) == 1
+        assert skills_dal.client.table.call_args[0][0] == "HolmesRunbooks"
+        assert _eq_filters(q) == {
+            "account_id": "acct-1",
+            "user_id": "end-user-1",
+            "subject_type": "PersonalRunbookCatalog",
+        }
+        # The SECURITY DEFINER RPC is gone; the API-role RLS branch replaced it.
+        skills_dal.client.rpc.assert_not_called()
+
+    def test_selects_every_column_the_parsing_loop_reads(self, skills_dal):
+        """An explicit column list must name everything the loop below consumes.
+
+        No stub can catch this: `_row()` hands back a full row, so a column missing from
+        the SELECT still appears in the fixture and every other test stays green. In
+        production `row.get()` just returns None for it. `alerts` is the one that hurts --
+        the loop skips any skill with neither symptom nor alerts, so an alert-only personal
+        skill would be dropped entirely, which is the bug this PR set out to fix for the
+        global tier.
+        """
+        _stub_personal_query(skills_dal, data=[self._row()])
+
+        skills_dal.get_personal_skill_catalog("end-user-1")
+
+        selected = {
+            col.strip()
+            for col in skills_dal.client.table.return_value.select.call_args[0][0].split(",")
+        }
+        assert {
+            "runbook_id",
+            "subject_name",
+            "symptoms",
+            "alerts",
+            "clusters",
+            "enabled",
+        } <= selected
+
+    def test_alert_only_skill_survives_the_catalog_read(self, skills_dal):
+        """Scoped by `alerts` INSTEAD of symptoms -- the UI validates "either"."""
+        _stub_personal_query(
+            skills_dal,
+            data=[self._row(symptoms=None, alerts=["KubePodCrashLooping"])],
         )
 
         result = skills_dal.get_personal_skill_catalog("end-user-1")
 
         assert result is not None and len(result) == 1
-        fn_name, params = skills_dal.client.rpc.call_args[0]
-        assert fn_name == "get_personal_skills"
-        # Parameter names must match the SQL function signature exactly
-        assert params == {"_account_id": "acct-1", "_user_id": "end-user-1"}
-        # The table must not be read directly
-        skills_dal.client.table.assert_not_called()
+        assert result[0].alerts == ["KubePodCrashLooping"]
+        assert result[0].symptom == ""
 
     def test_parses_rows_into_instructions(self, skills_dal):
-        skills_dal.client.rpc.return_value.execute.return_value = Mock(
-            data=[self._row(runbook_id="uuid-9", subject_name="Disk full")]
-        )
+        _stub_personal_query(skills_dal, data=[self._row(runbook_id="uuid-9", subject_name="Disk full")])
 
         result = skills_dal.get_personal_skill_catalog("end-user-1")
 
@@ -399,48 +461,45 @@ class TestPersonalSkills:
         assert result[0].symptom == "when the thing breaks"
 
     def test_skips_disabled_skills(self, skills_dal):
-        skills_dal.client.rpc.return_value.execute.return_value = Mock(
-            data=[self._row(enabled=False)]
-        )
+        _stub_personal_query(skills_dal, data=[self._row(enabled=False)])
 
         assert skills_dal.get_personal_skill_catalog("end-user-1") == []
 
     def test_skips_skills_without_symptom(self, skills_dal):
         """A skill with no symptom cannot be matched, so it is dropped."""
-        skills_dal.client.rpc.return_value.execute.return_value = Mock(
-            data=[self._row(symptoms=None)]
-        )
+        _stub_personal_query(skills_dal, data=[self._row(symptoms=None)])
 
         assert skills_dal.get_personal_skill_catalog("end-user-1") == []
 
     def test_filters_by_cluster(self, skills_dal):
         """Cluster scoping happens here, before any hierarchy dedup upstream."""
-        skills_dal.client.rpc.return_value.execute.return_value = Mock(
+        _stub_personal_query(
+            skills_dal,
             data=[
                 self._row(runbook_id="here", clusters=["test-cluster"]),
                 self._row(runbook_id="elsewhere", clusters=["other-cluster"]),
                 self._row(runbook_id="all-clusters", clusters=None),
-            ]
+            ],
         )
 
         result = skills_dal.get_personal_skill_catalog("end-user-1")
 
         assert {r.id for r in result} == {"here", "all-clusters"}
 
-    def test_no_user_id_does_not_call_rpc(self, skills_dal):
+    def test_no_user_id_does_not_query(self, skills_dal):
         """The server-initiated guardrail, enforced at the DAL too."""
         assert skills_dal.get_personal_skill_catalog("") is None
         assert skills_dal.get_personal_skill_catalog(None) is None
-        skills_dal.client.rpc.assert_not_called()
+        skills_dal.client.table.assert_not_called()
 
     def test_returns_none_when_disabled(self, skills_dal):
         skills_dal.enabled = False
         assert skills_dal.get_personal_skill_catalog("end-user-1") is None
-        skills_dal.client.rpc.assert_not_called()
+        skills_dal.client.table.assert_not_called()
 
-    def test_rpc_error_returns_none_rather_than_raising(self, skills_dal):
+    def test_read_error_returns_none_rather_than_raising(self, skills_dal):
         """A failed read must not break the whole chat request."""
-        skills_dal.client.rpc.side_effect = PGAPIError({"message": "boom"})
+        skills_dal.client.table.side_effect = PGAPIError({"message": "boom"})
 
         assert skills_dal.get_personal_skill_catalog("end-user-1") is None
 
@@ -473,6 +532,45 @@ class TestPersonalSkills:
             == ""
         )
 
+    @pytest.mark.parametrize(
+        "instructions",
+        [
+            [{"step": 1}],                # used to return the dict itself
+            [["a", "b"]],                 # used to return the inner list
+            [{"a": 1}, {"b": 2}],         # used to raise TypeError out of the join
+            ["ok", {"step": 2}],          # mixed: one good element is not enough
+            [None],
+            [7],
+        ],
+    )
+    def test_instruction_list_of_non_strings_yields_empty_string(
+        self, skills_dal, instructions
+    ):
+        """This function is typed `-> str`, and every path must honour that.
+
+        jsonb has no shape constraint, so `instructions` can hold non-strings. Returning the
+        element itself broke the contract (RobustaSkillInstruction.instruction is typed str,
+        so it then failed validation), and the multi-element join raised TypeError. Either way
+        the skill became unfetchable. "" is correct because it lets the caller's
+        `instruction or pretty()` fallback render the row instead.
+        """
+        result = skills_dal._extract_skill_instruction(
+            {"runbook": {"instructions": instructions}}, "x"
+        )
+
+        assert result == ""
+
+    def test_instruction_list_of_non_strings_does_not_log_the_body(
+        self, skills_dal, caplog
+    ):
+        """Personal skill bodies are private -- log element types, never contents."""
+        skills_dal._extract_skill_instruction(
+            {"runbook": {"instructions": [{"private": "SECRET-STEP-DO-NOT-LOG"}]}}, "x"
+        )
+
+        assert "SECRET-STEP-DO-NOT-LOG" not in caplog.text
+        assert "dict" in caplog.text
+
     @pytest.mark.parametrize("shape", [[], ["a"], "str", 7])
     def test_non_dict_runbook_yields_empty_string_rather_than_raising(
         self, skills_dal, shape
@@ -501,14 +599,12 @@ class TestPersonalSkills:
         id and title are required on the model, so an invalid row raises. If that reached
         the outer handler the user would silently lose every personal skill.
         """
-        skills_dal.client.rpc.return_value.execute.return_value = Mock(
-            data=[
+        _stub_personal_query(skills_dal, data=[
                 self._row(runbook_id=None),          # invalid: id is required
                 self._row(runbook_id="ok-1"),
                 self._row(subject_name=None),        # invalid: title is required
                 self._row(runbook_id="ok-2"),
-            ]
-        )
+            ])
 
         result = skills_dal.get_personal_skill_catalog("end-user-1")
 
@@ -516,26 +612,27 @@ class TestPersonalSkills:
 
     # ── get_personal_skill_content ──
 
-    def test_content_rpc_is_scoped_to_the_user(self, skills_dal):
-        """user_id is part of the lookup so one user cannot fetch another's body."""
-        skills_dal.client.rpc.return_value.execute.return_value = Mock(
-            data=[self._row()]
-        )
+    def test_content_is_scoped_to_the_user(self, skills_dal):
+        """user_id is part of the lookup so one user cannot fetch another's body.
+
+        RLS alone would not stop this: it admits Holmes to every personal row in the
+        account, so dropping the user_id filter would happily return another user's skill.
+        """
+        q = _stub_personal_query(skills_dal, data=[self._row()])
 
         result = skills_dal.get_personal_skill_content("uuid-1", "end-user-1")
 
         assert result is not None
-        fn_name, params = skills_dal.client.rpc.call_args[0]
-        assert fn_name == "get_personal_skill_content"
-        assert params == {
-            "_account_id": "acct-1",
-            "_user_id": "end-user-1",
-            "_runbook_id": "uuid-1",
+        assert _eq_filters(q) == {
+            "account_id": "acct-1",
+            "user_id": "end-user-1",
+            "runbook_id": "uuid-1",
+            "subject_type": "PersonalRunbookCatalog",
         }
 
     def test_content_normalizes_instructions_list(self, skills_dal):
-        skills_dal.client.rpc.return_value.execute.return_value = Mock(
-            data=[self._row(runbook={"instructions": ["only step"]})]
+        _stub_personal_query(
+            skills_dal, data=[self._row(runbook={"instructions": ["only step"]})]
         )
 
         result = skills_dal.get_personal_skill_content("uuid-1", "end-user-1")
@@ -550,8 +647,8 @@ class TestPersonalSkills:
         exception is swallowed here and the caller sees None, i.e. "not one of this user's
         skills", so the skill is offered in the prompt and can never be fetched.
         """
-        skills_dal.client.rpc.return_value.execute.return_value = Mock(
-            data=[self._row(symptoms=None, alerts=["KubePodCrashLooping"])]
+        _stub_personal_query(
+            skills_dal, data=[self._row(symptoms=None, alerts=["KubePodCrashLooping"])]
         )
 
         result = skills_dal.get_personal_skill_content("uuid-1", "end-user-1")
@@ -561,13 +658,13 @@ class TestPersonalSkills:
         assert result.instruction == "step one"
 
     def test_content_missing_returns_none(self, skills_dal):
-        skills_dal.client.rpc.return_value.execute.return_value = Mock(data=[])
+        _stub_personal_query(skills_dal, data=[])
 
         assert skills_dal.get_personal_skill_content("nope", "end-user-1") is None
 
-    def test_content_without_user_id_does_not_call_rpc(self, skills_dal):
+    def test_content_without_user_id_does_not_query(self, skills_dal):
         assert skills_dal.get_personal_skill_content("uuid-1", None) is None
-        skills_dal.client.rpc.assert_not_called()
+        skills_dal.client.table.assert_not_called()
 
 
 class TestSkillHierarchyConfig:
