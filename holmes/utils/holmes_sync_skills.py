@@ -12,6 +12,11 @@ from holmes.plugins.skills.skill_loader import (
 # skill -- from a GitHub repo, inline Helm values, or a ConfigMap/Secret mount -- loads as
 # SkillSource.USER and Holmes keeps no origin metadata, so they are all reported as
 # "custom". Distinguishing github/inline/configmap would require new origin tagging.
+# HolmesCustomSkills.status values. The column exists to surface a malformed SKILL.md, so
+# both are reachable: "ok" for a skill that parsed, "error" for one that did not.
+STATUS_OK = "ok"
+STATUS_ERROR = "error"
+
 SOURCE_LABELS = {
     SkillSource.USER: "custom",
     SkillSource.BUILTIN: "builtin",
@@ -55,14 +60,43 @@ def holmes_sync_skills_status(dal: SupabaseDal, config: Config) -> None:
                 "description": skill.description,
                 "content": skill.content,
                 "source_path": skill.source_path,
-                # Skills that fail to parse are logged and skipped by the loader, so
-                # everything reaching here parsed cleanly.
-                "status": "ok",
+                "status": STATUS_OK,
                 "error": None,
                 "updated_at": updated_at,
             }
             for skill in loaded.skills
             if skill.source in SOURCE_LABELS
+        ]
+
+        # A SKILL.md that failed to parse gets a row too. Without this the columns could
+        # never hold anything but "ok": the loader drops unparseable skills, so nothing
+        # broken ever reached the row builder and a user's malformed file simply vanished
+        # from the UI rather than showing up as broken.
+        #
+        # Keyed on the same skill_name the successful row would have used (the normalized
+        # directory name), so a file that starts failing replaces its own healthy row
+        # instead of accumulating a second one. If a name collides with a skill that loaded
+        # from a different path, the upsert is last-write-wins -- rare, and preferable to
+        # dropping the error.
+        rows += [
+            {
+                "account_id": dal.account_id,
+                "cluster_id": config.cluster_name,
+                "skill_name": failure.skill_name,
+                "source": SOURCE_LABELS.get(
+                    failure.source, SOURCE_LABELS[SkillSource.USER]
+                ),
+                # Nullable, and there is nothing trustworthy to put here -- the parse that
+                # would have produced them is what failed.
+                "description": None,
+                "content": None,
+                "source_path": failure.source_path,
+                "status": STATUS_ERROR,
+                "error": failure.error,
+                "updated_at": updated_at,
+            }
+            for failure in loaded.failed_skills
+            if failure.source in SOURCE_LABELS
         ]
 
         # Conservative: prune only when EVERY source was readable. A partially-readable load

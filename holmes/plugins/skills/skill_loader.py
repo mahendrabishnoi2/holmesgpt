@@ -171,18 +171,42 @@ def parse_skill_file(path: Path, source: SkillSource = SkillSource.USER) -> Skil
     )
 
 
+class SkillLoadProblem(BaseModel):
+    """Something that went wrong while loading filesystem skills.
+
+    `skill_name` is what splits the two kinds apart, and the split matters:
+
+    * NAMED -- a specific SKILL.md exists but could not be parsed. We know exactly which
+      skill is broken, so the mirror can show it with status="error" and the user can find
+      it in the UI instead of wondering why their file has no effect.
+    * UNNAMED -- a directory is missing or unreadable, or a configured path is not a skill
+      source at all. We do not know what skills should have been there, so anything built
+      from this load is incomplete and must not be used to DELETE.
+
+    Only the unnamed kind blocks pruning: a parse failure is a known state we can represent,
+    not an unknown one. Without that distinction a single malformed SKILL.md would suppress
+    pruning for the whole cluster, so deleting an unrelated skill would leave its row behind.
+    """
+
+    error: str
+    # Set only when a specific skill is identifiable. The normalized directory name, which
+    # is exactly what parse_skill_file would have defaulted to had the frontmatter parsed.
+    skill_name: Optional[str] = None
+    source_path: Optional[str] = None
+    source: Optional[SkillSource] = None
+
+
 def scan_skill_directory(
     directory: Path,
     source: SkillSource = SkillSource.USER,
     max_depth: int = 2,
-    problems: Optional[List[str]] = None,
+    problems: Optional[List[SkillLoadProblem]] = None,
 ) -> List[Skill]:
     """Scan a directory for SKILL.md files up to max_depth levels deep.
 
-    When `problems` is passed, every source that could not be read is appended to it. That
-    is what lets a caller tell "this directory really holds no skills" apart from "this
-    directory could not be read", which an empty return value alone cannot express. Callers
-    that DELETE based on what loaded need the distinction; see load_filesystem_skills.
+    When `problems` is passed, everything that went wrong is appended to it, so a caller can
+    tell "this directory really holds no skills" from "this directory could not be read" --
+    a distinction an empty return value cannot express. See SkillLoadProblem.
     """
     skills: List[Skill] = []
     directory = directory.resolve()
@@ -190,7 +214,9 @@ def scan_skill_directory(
     if not directory.is_dir():
         logging.warning(f"Skill directory does not exist: {directory}")
         if problems is not None:
-            problems.append(f"skill directory does not exist: {directory}")
+            problems.append(
+                SkillLoadProblem(error=f"skill directory does not exist: {directory}")
+            )
         return skills
 
     def on_walk_error(error: OSError) -> None:
@@ -205,7 +231,11 @@ def scan_skill_directory(
         """
         logging.warning(f"Failed to read skill directory {error.filename}: {error}")
         if problems is not None:
-            problems.append(f"failed to read skill directory {error.filename}: {error}")
+            problems.append(
+                SkillLoadProblem(
+                    error=f"failed to read skill directory {error.filename}: {error}"
+                )
+            )
 
     # followlinks=True so we traverse Kubernetes ConfigMap mounts, which
     # surface each key as `<dir>/<name>` -> `..data/<name>` -> a real file
@@ -231,7 +261,16 @@ def scan_skill_directory(
             except Exception as e:
                 logging.error(f"Failed to parse {skill_path}: {e}")
                 if problems is not None:
-                    problems.append(f"failed to parse {skill_path}: {e}")
+                    problems.append(
+                        SkillLoadProblem(
+                            error=str(e),
+                            # The dir name is what parse_skill_file falls back to, so the
+                            # failed row keys exactly as the successful one would have.
+                            skill_name=normalize_skill_name(Path(root).name),
+                            source_path=str(skill_path),
+                            source=source,
+                        )
+                    )
 
     return skills
 
@@ -267,24 +306,36 @@ def map_robusta_instruction_to_skill(
 
 
 class FilesystemSkills(BaseModel):
-    """Builtin + filesystem skills, plus whether every configured source was readable.
+    """Builtin + filesystem skills, plus everything that went wrong loading them.
 
-    `sources_ok` is False when any skill source could not be read: a missing directory, a
-    path that is neither a directory nor a SKILL.md, or a SKILL.md that failed to parse.
-
-    This exists because an empty skill list is ambiguous on its own -- it means either "there
-    genuinely are no skills" or "nothing could be read". A caller that only ADDS rows can
-    ignore the difference, but a caller that DELETES based on what loaded cannot: treating a
-    failed load as authoritative would prune rows for skills that are still on disk.
+    An empty skill list is ambiguous on its own -- either "there genuinely are no skills" or
+    "nothing could be read". A caller that only ADDS rows can ignore the difference; one that
+    DELETES based on what loaded cannot, since treating a failed load as authoritative would
+    prune rows for skills still on disk. `sources_ok` is what separates the two.
     """
 
     skills: List[Skill]
-    sources_ok: bool
+    problems: List[SkillLoadProblem] = []
+
+    @property
+    def sources_ok(self) -> bool:
+        """Whether this load is complete enough to DELETE from.
+
+        Only unnamed problems disqualify it. A named one (a SKILL.md that failed to parse)
+        is a known state the caller can represent as a row, so it must not suppress pruning
+        -- otherwise one malformed file would freeze the mirror for the whole cluster.
+        """
+        return all(p.skill_name is not None for p in self.problems)
+
+    @property
+    def failed_skills(self) -> List[SkillLoadProblem]:
+        """Problems attributable to one skill, for callers that surface them to users."""
+        return [p for p in self.problems if p.skill_name is not None]
 
 
 def _load_filesystem_skills_by_name(
     custom_skill_paths: Optional[List[Union[str, Path]]] = None,
-    problems: Optional[List[str]] = None,
+    problems: Optional[List[SkillLoadProblem]] = None,
 ) -> dict[str, Skill]:
     """Load builtin skills, then filesystem skills which override builtins by name.
 
@@ -329,12 +380,24 @@ def _load_filesystem_skills_by_name(
                 except Exception as e:
                     logging.error(f"Failed to parse skill file {path}: {e}")
                     if problems is not None:
-                        problems.append(f"failed to parse skill file {path}: {e}")
+                        problems.append(
+                            SkillLoadProblem(
+                                error=str(e),
+                                skill_name=normalize_skill_name(path.parent.name),
+                                source_path=str(path),
+                                source=SkillSource.USER,
+                            )
+                        )
             else:
                 logging.warning(f"Skill path is not a directory or SKILL.md file: {path}")
                 if problems is not None:
                     problems.append(
-                        f"skill path is not a directory or {SKILL_FILENAME} file: {path}"
+                        SkillLoadProblem(
+                            error=(
+                                f"skill path is not a directory or "
+                                f"{SKILL_FILENAME} file: {path}"
+                            )
+                        )
                     )
 
     return skills_by_name
@@ -352,18 +415,19 @@ def load_filesystem_skills(
     because for the mirror an empty result is a meaningful state (prune everything) as long
     as `sources_ok` is True.
     """
-    problems: List[str] = []
+    problems: List[SkillLoadProblem] = []
     skills_by_name = _load_filesystem_skills_by_name(custom_skill_paths, problems)
 
-    if problems:
+    unreadable = [p for p in problems if p.skill_name is None]
+    if unreadable:
         logging.warning(
             "%d skill source(s) could not be read; treating this load as incomplete: %s",
-            len(problems),
-            "; ".join(problems),
+            len(unreadable),
+            "; ".join(p.error for p in unreadable),
         )
 
     return FilesystemSkills(
-        skills=list(skills_by_name.values()), sources_ok=not problems
+        skills=list(skills_by_name.values()), problems=problems
     )
 
 

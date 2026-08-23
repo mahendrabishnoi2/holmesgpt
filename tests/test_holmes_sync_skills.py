@@ -129,3 +129,74 @@ def test_loader_failure_never_raises_and_skips_the_write(monkeypatch, tmp_path: 
     holmes_sync_skills_status(dal, _config([tmp_path]))
 
     dal.sync_skills.assert_not_called()
+
+
+def _broken_skill(dir_path: Path, name: str) -> None:
+    (dir_path / name).mkdir(parents=True, exist_ok=True)
+    (dir_path / name / "SKILL.md").write_text("no frontmatter here")
+
+
+def test_malformed_skill_gets_an_error_row(tmp_path: Path):
+    """A SKILL.md that fails to parse must appear as broken, not vanish.
+
+    Before this, the loader dropped unparseable skills, so nothing broken ever reached the
+    row builder -- status was always "ok" and error always NULL. A user's malformed file
+    simply had no effect anywhere in the product, discoverable only in the pod logs.
+    """
+    _write_skill(tmp_path, "good")
+    _broken_skill(tmp_path, "bad")
+    dal = _dal()
+
+    holmes_sync_skills_status(dal, _config([tmp_path]))
+
+    rows, _ = dal.sync_skills.call_args[0]
+    by_name = {r["skill_name"]: r for r in rows}
+
+    assert by_name["good"]["status"] == "ok"
+    assert by_name["good"]["error"] is None
+
+    bad = by_name["bad"]
+    assert bad["status"] == "error"
+    assert "frontmatter" in bad["error"]
+    assert bad["source"] == "custom"
+    assert bad["source_path"] is not None
+    # Nothing trustworthy to report -- the parse that would produce them is what failed.
+    assert bad["description"] is None
+    assert bad["content"] is None
+
+
+def test_malformed_skill_does_not_suppress_pruning(tmp_path: Path):
+    """A parse failure is a KNOWN state, now represented as a row, so it must not block the
+    prune. Otherwise one malformed file would freeze the mirror for the whole cluster and
+    deleting an unrelated skill would leave its row behind forever."""
+    _write_skill(tmp_path, "good")
+    _broken_skill(tmp_path, "bad")
+    dal = _dal()
+
+    holmes_sync_skills_status(dal, _config([tmp_path]))
+
+    assert dal.sync_skills.call_args[1]["prune"] is True
+
+
+def test_unreadable_source_still_suppresses_pruning(tmp_path: Path):
+    """The other half of the distinction: an unreadable path tells us nothing about what
+    skills should exist, so the load is not authoritative enough to delete from."""
+    _write_skill(tmp_path, "good")
+    dal = _dal()
+
+    holmes_sync_skills_status(dal, _config([tmp_path, tmp_path / "not-mounted"]))
+
+    assert dal.sync_skills.call_args[1]["prune"] is False
+
+
+def test_error_row_keeps_the_skill_from_being_pruned(tmp_path: Path):
+    """The failed skill is in the provided names, so the prune that follows will not delete
+    the very row that reports the failure."""
+    _broken_skill(tmp_path, "bad")
+    dal = _dal()
+
+    holmes_sync_skills_status(dal, _config([tmp_path]))
+
+    rows, _ = dal.sync_skills.call_args[0]
+    assert [r["skill_name"] for r in rows] == ["bad"]
+    assert dal.sync_skills.call_args[1]["prune"] is True

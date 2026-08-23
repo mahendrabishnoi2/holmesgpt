@@ -235,17 +235,33 @@ class TestLoadFilesystemSkills:
         assert loaded.sources_ok is False
         assert loaded.skills == []
 
-    def test_unparseable_skill_reports_not_ok(self, tmp_path: Path):
-        """A malformed SKILL.md is skipped by the loader, so without the health signal this
-        would look identical to a directory that legitimately holds no skills."""
+    def test_unparseable_skill_is_named_and_does_not_block_pruning(self, tmp_path: Path):
+        """A malformed SKILL.md is a KNOWN failure: we can say exactly which skill is broken.
+
+        So it is reported as a named problem the caller can surface as a row, and it must
+        NOT mark the load incomplete -- otherwise one bad file would suppress pruning for
+        the whole cluster and an unrelated deletion would never be reflected.
+        """
         broken = tmp_path / "broken"
         broken.mkdir()
         (broken / "SKILL.md").write_text("no frontmatter here")
 
         loaded = load_filesystem_skills(custom_skill_paths=[tmp_path])
 
-        assert loaded.sources_ok is False
         assert loaded.skills == []
+        assert loaded.sources_ok is True
+        assert [p.skill_name for p in loaded.failed_skills] == ["broken"]
+        assert loaded.failed_skills[0].source == SkillSource.USER
+        assert "frontmatter" in loaded.failed_skills[0].error
+
+    def test_unnamed_problems_are_not_reported_as_failed_skills(self, tmp_path: Path):
+        """The complement: an unreadable path cannot be attributed to a skill, so it blocks
+        pruning and must not produce a row claiming some skill failed."""
+        loaded = load_filesystem_skills(custom_skill_paths=[tmp_path / "does-not-exist"])
+
+        assert loaded.sources_ok is False
+        assert loaded.failed_skills == []
+        assert loaded.problems and loaded.problems[0].skill_name is None
 
     def test_unreadable_directory_reports_not_ok(self, tmp_path: Path, monkeypatch):
         """The dangerous case: the path exists so `is_dir()` passes, but it cannot be read.
@@ -270,8 +286,8 @@ class TestLoadFilesystemSkills:
         assert loaded.sources_ok is False
 
     def test_partial_failure_still_returns_the_readable_skills(self, tmp_path: Path):
-        """Conservative rule: a good path still loads, but the bad one taints sources_ok so
-        the caller will not prune the skills the failed path would have provided."""
+        """A good path still loads, but the UNREADABLE one taints sources_ok, so the caller
+        will not prune the skills that path would have provided."""
         good = tmp_path / "good"
         _write_skill(good / "alpha", "alpha")
 
