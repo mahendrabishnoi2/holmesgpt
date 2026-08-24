@@ -51,53 +51,65 @@ def holmes_sync_skills_status(dal: SupabaseDal, config: Config) -> None:
         # UTC-aware: a naive timestamp would be interpreted in the database session's
         # timezone, so updated_at would not reflect the real sync time off-UTC.
         updated_at = datetime.now(timezone.utc).isoformat()
-        rows = [
-            {
+        # Keyed by skill_name, because the batch upsert conflicts on
+        # (account_id, cluster_id, skill_name) and PostgreSQL refuses an
+        # ON CONFLICT DO UPDATE that touches the same row twice. Two rows sharing a name do
+        # not resolve last-write-wins -- they abort the whole statement, and since the prune
+        # runs after the upsert one collision would silently kill the entire sync.
+        by_name: dict[str, dict] = {}
+
+        def row(skill_name, source, description, content, source_path, status, error):
+            return {
                 "account_id": dal.account_id,
                 "cluster_id": config.cluster_name,
-                "skill_name": skill.name,
-                "source": SOURCE_LABELS.get(skill.source, skill.source.value),
-                "description": skill.description,
-                "content": skill.content,
-                "source_path": skill.source_path,
-                "status": STATUS_OK,
-                "error": None,
+                "skill_name": skill_name,
+                "source": source,
+                "description": description,
+                "content": content,
+                "source_path": source_path,
+                "status": status,
+                "error": error,
                 "updated_at": updated_at,
             }
-            for skill in loaded.skills
-            if skill.source in SOURCE_LABELS
-        ]
+
+        for skill in loaded.skills:
+            if skill.source in SOURCE_LABELS:
+                by_name[skill.name] = row(
+                    skill.name,
+                    SOURCE_LABELS[skill.source],
+                    skill.description,
+                    skill.content,
+                    skill.source_path,
+                    STATUS_OK,
+                    None,
+                )
 
         # A SKILL.md that failed to parse gets a row too. Without this the columns could
         # never hold anything but "ok": the loader drops unparseable skills, so nothing
         # broken ever reached the row builder and a user's malformed file simply vanished
         # from the UI rather than showing up as broken.
         #
-        # Keyed on the same skill_name the successful row would have used (the normalized
-        # directory name), so a file that starts failing replaces its own healthy row
-        # instead of accumulating a second one. If a name collides with a skill that loaded
-        # from a different path, the upsert is last-write-wins -- rare, and preferable to
-        # dropping the error.
-        rows += [
-            {
-                "account_id": dal.account_id,
-                "cluster_id": config.cluster_name,
-                "skill_name": failure.skill_name,
-                "source": SOURCE_LABELS.get(
-                    failure.source, SOURCE_LABELS[SkillSource.USER]
-                ),
-                # Nullable, and there is nothing trustworthy to put here -- the parse that
-                # would have produced them is what failed.
-                "description": None,
-                "content": None,
-                "source_path": failure.source_path,
-                "status": STATUS_ERROR,
-                "error": failure.error,
-                "updated_at": updated_at,
-            }
-            for failure in loaded.failed_skills
-            if failure.source in SOURCE_LABELS
-        ]
+        # Keyed on the same skill_name a successful parse would have produced (the
+        # normalized directory name), so a file that starts failing replaces its own healthy
+        # row. Written AFTER the healthy rows and allowed to overwrite them: when two
+        # configured paths hold the same directory name and one is malformed, the error is
+        # the thing worth surfacing -- a broken skill the user cannot see is exactly what
+        # this feature exists to fix.
+        for failure in loaded.failed_skills:
+            if failure.source in SOURCE_LABELS:
+                by_name[failure.skill_name] = row(
+                    failure.skill_name,
+                    SOURCE_LABELS[failure.source],
+                    # Nullable, and there is nothing trustworthy to put here -- the parse
+                    # that would have produced them is what failed.
+                    None,
+                    None,
+                    failure.source_path,
+                    STATUS_ERROR,
+                    failure.error,
+                )
+
+        rows = list(by_name.values())
 
         # Conservative: prune only when EVERY source was readable. A partially-readable load
         # must not delete the rows for the part that failed, and a fully-unreadable one must

@@ -200,3 +200,48 @@ def test_error_row_keeps_the_skill_from_being_pruned(tmp_path: Path):
     rows, _ = dal.sync_skills.call_args[0]
     assert [r["skill_name"] for r in rows] == ["bad"]
     assert dal.sync_skills.call_args[1]["prune"] is True
+
+
+def test_rows_are_unique_by_skill_name(tmp_path: Path):
+    """The batch upsert conflicts on (account_id, cluster_id, skill_name), and PostgreSQL
+    refuses an ON CONFLICT DO UPDATE that touches the same row twice -- it raises a
+    cardinality violation. So two rows sharing a skill_name do not resolve last-write-wins;
+    they abort the whole statement. sync_skills catches that, and because the prune runs
+    after the upsert in the same try block, ONE name collision silently kills the entire
+    mirror sync for the cluster rather than just the colliding row.
+
+    Reachable whenever two custom_skill_paths hold the same directory name and one of them
+    is malformed.
+    """
+    good_path = tmp_path / "a"
+    bad_path = tmp_path / "b"
+    _write_skill(good_path, "shared")
+    _broken_skill(bad_path, "shared")
+    dal = _dal()
+
+    holmes_sync_skills_status(dal, _config([good_path, bad_path]))
+
+    rows, _ = dal.sync_skills.call_args[0]
+    keys = [(r["account_id"], r["cluster_id"], r["skill_name"]) for r in rows]
+    assert len(keys) == len(set(keys)), f"duplicate upsert keys: {keys}"
+
+
+def test_failure_row_wins_over_a_same_named_healthy_skill(tmp_path: Path):
+    """When they collide the error must survive, not be masked by the healthy row.
+
+    A broken skill the user cannot see is the whole problem this feature exists to fix, so
+    silently preferring the row that parsed would defeat it.
+    """
+    good_path = tmp_path / "a"
+    bad_path = tmp_path / "b"
+    _write_skill(good_path, "shared")
+    _broken_skill(bad_path, "shared")
+    dal = _dal()
+
+    holmes_sync_skills_status(dal, _config([good_path, bad_path]))
+
+    rows, _ = dal.sync_skills.call_args[0]
+    shared = [r for r in rows if r["skill_name"] == "shared"]
+    assert len(shared) == 1
+    assert shared[0]["status"] == "error"
+    assert "frontmatter" in shared[0]["error"]
